@@ -32,11 +32,28 @@
   canvas{width:100%;height:180px;display:block}
   .footer{color:var(--muted);font-size:12px;margin:6px 0 20px}
 
-  /* User Role Summary */
-  .summary-title{font-weight:600;margin:0 0 8px 0}
-  .summary-grid{display:grid;grid-template-columns:1fr auto;gap:6px;align-items:center}
-  .summary-row{padding:6px 8px;border-radius:10px;background:#f9fafb;border:1px solid var(--border)}
-  .summary-count{font-variant-numeric:tabular-nums}
+/* User Role Summary */
+.summary-title{font-weight:600;margin:0 0 8px 0}
+.summary-row{
+display:grid;
+grid-template-columns: 1fr auto; /* role | count */
+gap:6px;
+align-items:center;
+padding:6px 8px;
+border-radius:10px;
+background:#f9fafb;
+border:1px solid var(--border);
+}
+.summary-role{
+text-align:left;
+justify-self:start;
+overflow-wrap:anywhere;   /* keep long names from overflowing */
+}
+.summary-count{
+text-align:right;
+justify-self:end;
+font-variant-numeric:tabular-nums;
+}
 </style>
 </head>
 <body>
