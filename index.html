@@ -31,6 +31,21 @@
   #drop.active{display:flex}
   canvas{width:100%;height:180px;display:block}
   .footer{color:var(--muted);font-size:12px;margin:6px 0 20px}
+
+  /* User Role Summary */
+  .summary-title{font-weight:600;margin:0 0 8px 0}
+  .summary-row{
+    display:grid;
+    grid-template-columns: 1fr auto; /* role | count */
+    gap:6px;
+    align-items:center;
+    padding:6px 8px;
+    border-radius:10px;
+    background:#f9fafb;
+    border:1px solid var(--border);
+  }
+  .summary-role{ text-align:left; justify-self:start; overflow-wrap:anywhere; }
+  .summary-count{ text-align:right; justify-self:end; font-variant-numeric:tabular-nums; }
 </style>
 </head>
 <body>
@@ -63,15 +78,22 @@
     <canvas id="trend"></canvas>
   </div>
 
+  <!-- User Role Summary (ignores Role filter) -->
+  <div class="card" id="userSummaryCard">
+    <h3 class="summary-title">User Role Summary</h3>
+    <div id="userSummaryBody"></div>
+    <div id="userSummaryNote" class="muted" style="margin-top:6px;"></div>
+  </div>
+
   <div class="card" style="overflow:auto">
     <table id="tbl">
       <thead>
         <tr>
           <th>Timestamp</th><th>MemberUPN</th><th>Member</th><th>Role</th>
-          <th>Justification</th><th>Activity</th><th>Result</th><th>ResultReason</th>
+          <th>Justification</th><th>Activity</th><th>Result</th>
         </tr>
       </thead>
-      <tbody id="tbody"><tr><td class="muted" colspan="8">Loading…</td></tr></tbody>
+      <tbody id="tbody"><tr><td class="muted" colspan="7">Loading…</td></tr></tbody>
     </table>
   </div>
   <div class="footer">
@@ -80,7 +102,7 @@
   </div>
 </main>
 
-<!-- Load offline data without fetch(): the PS script writes window.PIM_ACTIVATIONS = [...] -->
+<!-- Offline data bundle written by your PowerShell: window.PIM_ACTIVATIONS = [...] -->
 <script src="./PIM_Activations.data.js"></script>
 
 <script>
@@ -95,6 +117,9 @@
   const q = el('q'), role = el('role'), user = el('user'), result = el('result'), from = el('from'), to = el('to');
   const tbody = el('tbody');
   const trendCanvas = el('trend');
+
+  const userSummaryBody = el('userSummaryBody');
+  const userSummaryNote = el('userSummaryNote');
 
   let rows = [];
   let filtered = [];
@@ -111,8 +136,8 @@
       Role: r.Role ?? "",
       Justification: r.Justification ?? "",
       Activity: r.Activity ?? "",
-      Result: r.Result ?? "",
-      ResultReason: r.ResultReason ?? ""
+      Result: r.Result ?? ""
+      // ResultReason intentionally removed from UI
     }));
   }
 
@@ -120,7 +145,7 @@
     tbody.innerHTML = '';
     if (!data.length){
       const tr = document.createElement('tr');
-      tr.innerHTML = '<td class="muted" colspan="8">No rows match your filters.</td>';
+      tr.innerHTML = '<td class="muted" colspan="7">No rows match your filters.</td>';
       tbody.appendChild(tr);
       return;
     }
@@ -137,7 +162,6 @@
         <td>${escapeHtml(r.Justification||'')}</td>
         <td>${escapeHtml(r.Activity||'')}</td>
         <td><span class="chip ${r.Result==='success'?'ok':r.Result==='failure'?'bad':''}">${escapeHtml(r.Result||'')}</span></td>
-        <td>${escapeHtml(r.ResultReason||'')}</td>
       `;
       frag.appendChild(tr);
     }
@@ -158,25 +182,73 @@
     if (vals.includes(value)) sel.value = value; else sel.value = '';
   }
 
-  function applyFilters(){
-    const needle = q.value.trim().toLowerCase();
-    const f = from.value ? new Date(from.value) : null;
-    const t = to.value ? new Date(to.value + 'T23:59:59.999') : null;
+  // Helper: returns rows filtered by all controls, with option to ignore Role filter
+  function filterRows(ignoreRole = false){
+    const needle  = q.value.trim().toLowerCase();
+    const f       = from.value ? new Date(from.value) : null;
+    const t       = to.value   ? new Date(to.value + 'T23:59:59.999') : null;
+    const upnSel  = user.value;
+    const resSel  = result.value;
+    const roleSel = role.value;
 
-    filtered = rows.filter(r=>{
+    return rows.filter(r => {
       const ts = new Date(r.Timestamp);
       if (f && (!ts || ts < f)) return false;
       if (t && (!ts || ts > t)) return false;
-      if (role.value && r.Role !== role.value) return false;
-      if (user.value && r.MemberUPN !== user.value) return false;
-      if (result.value && r.Result !== result.value) return false;
-      if (!needle) return true;
-      return Object.values(r).some(v => (v??'').toString().toLowerCase().includes(needle));
+      if (upnSel && r.MemberUPN !== upnSel) return false;
+      if (resSel && r.Result !== resSel) return false;
+      if (!ignoreRole && roleSel && r.Role !== roleSel) return false;
+      if (needle && !Object.values(r).some(v => (v ?? '').toString().toLowerCase().includes(needle))) return false;
+      return true;
     }).sort((a,b)=> new Date(b.Timestamp) - new Date(a.Timestamp));
+  }
 
+  function applyFilters(){
+    // Table + chart respect ALL filters (including Role)
+    filtered = filterRows(false);
     renderTable(filtered);
     drawTrend(filtered);
+
+    // Summary ignores Role filter
+    renderUserSummary();
+
     exportBtn.disabled = filtered.length === 0;
+  }
+
+  function renderUserSummary(){
+    userSummaryBody.innerHTML = '';
+    userSummaryNote.textContent = '';
+
+    const upn = user.value;
+    if (!upn){
+      userSummaryNote.textContent = 'Select a user to see their roles and activation counts (ignores the Role filter).';
+      return;
+    }
+
+    // Use all current filters EXCEPT Role
+    const base = filterRows(true);
+    const subset = base.filter(r => r.MemberUPN === upn);
+
+    if (subset.length === 0){
+      userSummaryNote.textContent = 'No activations for this user in the current view.';
+      return;
+    }
+
+    const counts = new Map();
+    for (const r of subset){
+      const roleName = r.Role || '(Unknown role)';
+      counts.set(roleName, (counts.get(roleName)||0) + 1);
+    }
+    const items = Array.from(counts.entries()).sort((a,b)=> b[1]-a[1]);
+
+    for (const [roleName, count] of items){
+      const row = document.createElement('div');
+      row.className = 'summary-row';
+      row.innerHTML = `<div class="summary-role">${escapeHtml(roleName)}</div><div class="summary-count">${count}</div>`;
+      userSummaryBody.appendChild(row);
+    }
+
+    userSummaryNote.textContent = `Total activations for ${upn}: ${subset.length}`;
   }
 
   function drawTrend(data){
@@ -248,7 +320,7 @@
   }
 
   function exportCsv(){
-    const header = ["Timestamp","MemberUPN","Member","Role","Justification","Activity","Result","ResultReason"];
+    const header = ["Timestamp","MemberUPN","Member","Role","Justification","Activity","Result"];
     const lines = [header.join(',')];
     for (const r of filtered){
       const row = header.map(h=>{
@@ -265,7 +337,6 @@
     URL.revokeObjectURL(a.href);
   }
 
-  // ---- startup: prefer data from the JS bundle, else show guidance ----
   function initialLoad(){
     if (Array.isArray(window.PIM_ACTIVATIONS)) {
       hideBanner();
@@ -273,6 +344,7 @@
     } else {
       showInfo('No PIM_Activations.data.js found yet. Run your PowerShell to generate it, or pick a JSON export below.');
       renderTable([]); // clear placeholder
+      renderUserSummary();
     }
   }
 

@@ -91,6 +91,9 @@ $rows = foreach ($e in $events) {
   # Justification
   $just = Get-ADetail $e.additionalDetails @('Justification','Reason')
 
+  $resultReason =
+  if ($e.resultReason -and ($e.resultReason -ne $just)) { $e.resultReason } else { $null }
+  
   [pscustomobject]@{
     Timestamp     = $e.activityDateTime
     MemberUPN     = $upn
@@ -99,7 +102,7 @@ $rows = foreach ($e in $events) {
     Justification = $just
     Activity      = $e.activityDisplayName
     Result        = $e.result
-    ResultReason  = $e.resultReason
+    ResultReason  = if ($e.resultReason -and ($e.resultReason -ne $just)) { $e.resultReason } else { $null }
   }
 }
 
