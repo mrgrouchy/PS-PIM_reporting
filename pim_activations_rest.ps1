@@ -4,7 +4,8 @@ param(
   [datetime]$StartDate = (Get-Date).AddDays(-$Days),
   [datetime]$EndDate   = (Get-Date),
   [switch]$CompletedOnly,
-  [string]$OutputPath = (Get-Location)   # <-- NEW: where index.html lives
+  [string]$OutputPath = (Get-Location),
+  [switch]$DebugTickets
 )
 
 # --- minimal dependency: Microsoft.Graph.Authentication only ---
@@ -23,17 +24,90 @@ if (-not (Get-MgContext)) {
 
 # Helpers
 function ODataUtc([datetime]$d) { $d.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss'Z'") }
-function Get-ADetail { param($arr,[string[]]$keys)
-  if (-not $arr) { return $null }
-  $lk = $keys | ForEach-Object { $_.ToLower() }
-  ($arr | Where-Object { $lk -contains ($_.key.ToLower()) } | Select-Object -First 1).value
+
+function Get-ADetail {
+  [CmdletBinding()]
+  param([object]$Details,[string[]]$Keys)
+  if (-not $Details -or -not $Keys) { return $null }
+  $lk = @($Keys | ForEach-Object { $_.ToString().ToLower() })
+  foreach ($item in @($Details)) {
+    if ($null -eq $item) { continue }
+    $name = $null
+    foreach ($f in 'key','Key','name','Name','displayName') {
+      if ($item.PSObject.Properties.Match($f).Count -gt 0 -and $item.$f) { $name = $item.$f; break }
+    }
+    if (-not $name) { continue }
+    if ($lk -notcontains $name.ToString().ToLower()) { continue }
+    foreach ($vf in 'value','Value','AdditionalDetailsValue','newValue','NewValue') {
+      if ($item.PSObject.Properties.Match($vf).Count -gt 0 -and $item.$vf) {
+        $v = $item.$vf
+        $text = $v.ToString()
+        if ($text -match '^\s*"(.*)"\s*$') { $text = $matches[1] }
+        if ($text.TrimStart().StartsWith("{") -or $text.TrimStart().StartsWith("[")) {
+          try {
+            $obj = $text | ConvertFrom-Json -ErrorAction Stop
+            if ($obj -is [System.Collections.IEnumerable]) {
+              foreach ($elem in @($obj)) {
+                foreach ($nf in 'name','Name','key','Key','displayName') {
+                  if ($elem.PSObject.Properties.Match($nf).Count -gt 0) {
+                    $nm = $elem.$nf
+                    if ($nm -and ($lk -contains $nm.ToString().ToLower())) {
+                      foreach ($valf in 'value','Value','newValue','NewValue') {
+                        if ($elem.PSObject.Properties.Match($valf).Count -gt 0 -and $elem.$valf) { return $elem.$valf }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            if ($obj -is [System.Collections.IDictionary]) {
+              foreach ($k in $Keys) {
+                if ($obj.Contains($k)) { return $obj[$k] }
+                $mk = $obj.Keys | Where-Object { $_.ToString().ToLower() -eq $k.ToLower() } | Select-Object -First 1
+                if ($mk) { return $obj[$mk] }
+              }
+            }
+          } catch {}
+        }
+        if ($text) { return $text }
+      }
+    }
+  }
+  return $null
+}
+
+function Get-Ticket { param([object]$Event)
+  if (-not $Event) { return $null }
+  $keys = @('TicketNumber','Ticket','Ticket Number','TicketId','Ticket ID','Incident','IncidentId','ChangeNumber','ChangeId','WorkItemId','ChangeTicket','Change Request')
+  $t = Get-ADetail $Event.additionalDetails $keys
+  if ($t) { return $t }
+  if ($Event.targetResources -and $Event.targetResources[0].modifiedProperties) {
+    $t = Get-ADetail $Event.targetResources[0].modifiedProperties $keys
+    if ($t) { return $t }
+  }
+  if ($Event.resultReason) {
+    try {
+      $rr = $Event.resultReason.ToString()
+      if ($rr.TrimStart().StartsWith("{") -or $rr.TrimStart().StartsWith("[")) {
+        $obj = $rr | ConvertFrom-Json -ErrorAction Stop
+        $t = Get-ADetail $obj $keys
+        if ($t) { return $t }
+        foreach ($k in $keys) {
+          if ($obj.PSObject.Properties.Name -contains $k) { return $obj.$k }
+          $mk = $obj.PSObject.Properties.Name | Where-Object { $_.ToLower() -eq $k.ToLower() } | Select-Object -First 1
+          if ($mk) { return $obj.$mk }
+        }
+      }
+    } catch {}
+  }
+  return $null
 }
 
 $start = ODataUtc $StartDate
 $end   = ODataUtc $EndDate
 Write-Verbose "Window: $start .. $end"
 
-# Strict PIM activation phrases
+# PIM activation phrases
 $activityFilter = if ($CompletedOnly) {
   "(activityDisplayName eq 'Add member to role completed (PIM activation)')"
 } else {
@@ -43,9 +117,7 @@ $activityFilter = if ($CompletedOnly) {
   ")"
 }
 
-# Full OData filter: PIM RoleManagement only, within time window
 $filter = "$activityFilter and (category eq 'RoleManagement') and activityDateTime ge $start and activityDateTime le $end"
-# Encode and build URL
 $qs   = '$filter=' + [uri]::EscapeDataString($filter) + '&$top=999'
 $uri  = "/v1.0/auditLogs/directoryAudits?$qs"
 Write-Verbose "GET $uri"
@@ -53,171 +125,113 @@ Write-Verbose "GET $uri"
 # Fetch with paging
 $events = @()
 try {
-  $resp = Invoke-MgGraphRequest -Method GET -Uri $uri -OutputType PSObject
-  $page = 1
-  while ($resp.value) {
-    Write-Verbose "Page $page : received $($resp.value.Count) events"
-    $events += $resp.value
-    if ($resp.'@odata.nextLink') {
-      $page++
-      $resp = Invoke-MgGraphRequest -Method GET -Uri $resp.'@odata.nextLink' -OutputType PSObject
-    } else { break }
+  $resp = Invoke-MgGraphRequest -Method GET -Uri $uri -OutputType PSObject -ErrorAction Stop
+  $events += @($resp.value)
+  while ($resp.'@odata.nextLink') {
+    $resp = Invoke-MgGraphRequest -Method GET -Uri $resp.'@odata.nextLink' -OutputType PSObject -ErrorAction Stop
+    $events += @($resp.value)
   }
 } catch {
   Write-Error "Failed to fetch audit logs: $($_.Exception.Message)"
   return
 }
 
-Write-Verbose "Total fetched: $($events.Count)"
-
-# Shape (no IDs) → Timestamp, MemberUPN, Member, Role, Justification, Activity, Result, ResultReason
+# Shape rows
 $rows = foreach ($e in $events) {
-  # Member (affected user)
-  $tUser  = $e.targetResources | Where-Object { $_.type -match '^User$' } | Select-Object -First 1
-  $member = $tUser.displayName
-  $upn    = $tUser.userPrincipalName
-  if (-not $upn -and $e.additionalDetails) {
-    $upn    = Get-ADetail $e.additionalDetails @('UserPrincipalName','TargetUserPrincipalName','AssigneeUPN','SubjectUserPrincipalName')
-    if (-not $member) { $member = Get-ADetail $e.additionalDetails @('TargetUser','Assignee','Member','SubjectDisplayName') }
+  $upn = $e.initiatedBy.user.userPrincipalName
+  if (-not $upn -and $e.targetResources -and $e.targetResources[0].userPrincipalName) { $upn = $e.targetResources[0].userPrincipalName }
+  $member = $e.initiatedBy.user.displayName
+  if (-not $member -and $e.targetResources -and $e.targetResources[0].displayName) { $member = $e.targetResources[0].displayName }
+  $role = $null
+  if ($e.targetResources -and $e.targetResources[0].displayName) { $role = $e.targetResources[0].displayName }
+  if (-not $role -and $e.targetResources -and $e.targetResources[0].modifiedProperties) {
+    $role = Get-ADetail $e.targetResources[0].modifiedProperties @('Role','RoleName','Role name','Role Display Name','displayName')
+  }
+  $just = Get-ADetail $e.additionalDetails @('Justification','Reason','JustificationText','Justification Text')
+  if (-not $just -and $e.resultReason) { $just = $e.resultReason }
+  $ticket = Get-Ticket $e
+
+  if ($DebugTickets -and -not $ticket) {
+    if (-not $script:_ticketProbes) { $script:_ticketProbes = @() }
+    $probe = [ordered]@{
+      Id = $e.id; MemberUPN = $upn; Activity = $e.activityDisplayName
+      additionalDetails_keys = @($e.additionalDetails | ForEach-Object {
+        if ($_ -ne $null) {
+          if ($_.PSObject.Properties.Name -contains 'key') { $_.key }
+          elseif ($_.PSObject.Properties.Name -contains 'name') { $_.name }
+          elseif ($_.PSObject.Properties.Name -contains 'displayName') { $_.displayName }
+        }
+      }) | Where-Object { $_ }
+      modifiedProperties_keys = @()
+      resultReason = $e.resultReason
+    }
+    if ($e.targetResources -and $e.targetResources[0].modifiedProperties) {
+      $probe.modifiedProperties_keys = @($e.targetResources[0].modifiedProperties | ForEach-Object {
+        if ($_ -ne $null) {
+          if ($_.PSObject.Properties.Name -contains 'key') { $_.key }
+          elseif ($_.PSObject.Properties.Name -contains 'name') { $_.name }
+          elseif ($_.PSObject.Properties.Name -contains 'displayName') { $_.displayName }
+        }
+      }) | Where-Object { $_ }
+    }
+    $script:_ticketProbes += [pscustomobject]$probe
   }
 
-  # Role (best-effort from targetResources or additionalDetails — no external lookups)
-  $tRole = $e.targetResources | Where-Object { $_.type -match '^role$|UnifiedRoleDefinition$' } | Select-Object -First 1
-  $role  = $tRole.displayName
-  if (-not $role -and $e.additionalDetails) {
-    $role = Get-ADetail $e.additionalDetails @('RoleDefinitionName','Role','RoleName','PrivilegedRole','Role Display Name','RoleDefinitionDisplayName')
-  }
-
-  # Justification
-  $just = Get-ADetail $e.additionalDetails @('Justification','Reason')
-
-  $resultReason =
-  if ($e.resultReason -and ($e.resultReason -ne $just)) { $e.resultReason } else { $null }
-  
   [pscustomobject]@{
+    Id            = ("PIM_{0}_{1}_{2}" -f ($e.correlationId ?? "n/a"), ($e.id ?? "n/a"), ([DateTimeOffset]$e.activityDateTime).Ticks)
+    Key           = ("{0}|{1}|{2}|{3}|{4}" -f ([DateTime]$e.activityDateTime).ToString("dd/MM/yyyy HH:mm:ss"), $upn, $role, $e.activityDisplayName, $e.result)
     Timestamp     = $e.activityDateTime
     MemberUPN     = $upn
     Member        = $member
     Role          = $role
     Justification = $just
-    Activity      = $e.activityDisplayName
-    Result        = $e.result
-    ResultReason  = if ($e.resultReason -and ($e.resultReason -ne $just)) { $e.resultReason } else { $null }
-  }
-}
-
-# =========================
-# Output + merge (append-only)
-# =========================
-$makeKey = {
-  param($e,$upn,$role)
-  # Fallback key in case old data lacks Id
-  "{0}|{1}|{2}|{3}|{4}" -f ($e.activityDateTime), ($upn ?? ''), ($role ?? ''), ($e.activityDisplayName ?? ''), ($e.result ?? '')
-}
-
-# Shape rows (now include Id + Key for dedupe; Id won't be shown by the page)
-$rows = foreach ($e in $events) {
-  # Member
-  $tUser  = $e.targetResources | Where-Object { $_.type -match '^User$' } | Select-Object -First 1
-  $member = $tUser.displayName
-  $upn    = $tUser.userPrincipalName
-  if (-not $upn -and $e.additionalDetails) {
-    $upn = Get-ADetail $e.additionalDetails @('UserPrincipalName','TargetUserPrincipalName','AssigneeUPN','SubjectUserPrincipalName')
-    if (-not $member) { $member = Get-ADetail $e.additionalDetails @('TargetUser','Assignee','Member','SubjectDisplayName') }
-  }
-
-  # Role
-  $tRole = $e.targetResources | Where-Object { $_.type -match '^role$|UnifiedRoleDefinition$' } | Select-Object -First 1
-  $role  = $tRole.displayName
-  if (-not $role -and $e.additionalDetails) {
-    $role = Get-ADetail $e.additionalDetails @('RoleDefinitionName','Role','RoleName','PrivilegedRole','Role Display Name','RoleDefinitionDisplayName')
-  }
-
-  # Justification
-  $just = Get-ADetail $e.additionalDetails @('Justification','Reason')
-
-  [pscustomobject]@{
-    Id            = $e.id                          # <-- used for dedupe, not displayed
-    Key           = & $makeKey $e $upn $role       # <-- fallback if Id missing in older data
-    Timestamp     = $e.activityDateTime
-    MemberUPN     = $upn
-    Member        = $member
-    Role          = $role
-    Justification = $just
+    Ticket        = $ticket
     Activity      = $e.activityDisplayName
     Result        = $e.result
     ResultReason  = $e.resultReason
   }
 }
 
-# Where to persist
-$webDir       = Get-Location
-$storeJson    = Join-Path $webDir "PIM_Activations.json"
-$storeJs      = Join-Path $webDir "PIM_Activations.data.js"
-$stamp        = Get-Date -Format 'yyyyMMdd_HHmmss'
+# -------- Merge with existing store and print emoji summary --------
+if (-not (Test-Path $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
+$storePath = Join-Path $OutputPath "PIM_Activations.json"
+$jsPath    = Join-Path $OutputPath "PIM_Activations.data.js"
 
-# Load existing store (if any)
 $existing = @()
-if (Test-Path $storeJson) {
-  try   { $existing = Get-Content $storeJson -Raw | ConvertFrom-Json }
-  catch { Write-Warning "Couldn't read existing PIM_Activations.json: $($_.Exception.Message)" }
-}
-if (-not ($existing -is [System.Collections.IEnumerable])) { $existing = @() }
-
-# Build hash sets for dedupe
-$seenIds  = [System.Collections.Generic.HashSet[string]]::new()
-$seenKeys = [System.Collections.Generic.HashSet[string]]::new()
-
-foreach ($r in $existing) {
-  if ($r.PSObject.Properties.Match('Id').Count -gt 0 -and $r.Id) { $null = $seenIds.Add([string]$r.Id) }
-  if ($r.PSObject.Properties.Match('Key').Count -gt 0 -and $r.Key) { $null = $seenKeys.Add([string]$r.Key) }
+if (Test-Path $storePath) {
+  try { $existing = Get-Content -Raw -Path $storePath | ConvertFrom-Json -ErrorAction Stop } catch { $existing = @() }
 }
 
-# Partition new rows into (new vs already stored)
+$ids = @{}
+foreach ($r in @($existing)) { if ($r.Id) { $ids[$r.Id] = $true } elseif ($r.Key) { $ids[$r.Key] = $true } }
+
 $newRows = @()
-foreach ($r in $rows) {
-  $hasId = ($r.Id -ne $null -and $r.Id -ne "")
-  $dupById  = $hasId -and $seenIds.Contains([string]$r.Id)
-  $dupByKey = -not $hasId -and $seenKeys.Contains([string]$r.Key)
-
-  if (-not ($dupById -or $dupByKey)) {
-    # remember in sets so we don't add duplicates within this batch
-    if ($hasId) { $null = $seenIds.Add([string]$r.Id) } else { $null = $seenKeys.Add([string]$r.Key) }
-    $newRows += $r
-  }
+foreach ($r in @($rows)) {
+  $k = if ($r.Id) { $r.Id } else { $r.Key }
+  if (-not $ids.ContainsKey($k)) { $newRows += $r; $ids[$k] = $true }
 }
 
-# Merge and sort (keep everything we have, newest first)
-$merged = @($existing + $newRows) | Sort-Object Timestamp -Descending
+$merged = @($existing) + @($newRows) | Sort-Object {[datetime]$_.Timestamp}
 
-# (Optional) cap the store so it doesn't grow forever.
-$cutoff = (Get-Date).AddDays(-365)
-$merged = $merged | Where-Object { [datetime]$_.Timestamp -ge $cutoff }
+$existingCount = @($existing).Count
+$newCount      = @($newRows).Count
+$totalCount    = @($merged).Count
 
-# Console summary
-Write-Host ("🧮 Existing: {0}, New this run: {1}, Total now: {2}" -f $existing.Count, $newRows.Count, $merged.Count)
-
-# CSV export (only the NEW rows this run), omit Id/Key in CSV
-if ($newRows.Count -gt 0) {
-  $newCsv = Join-Path $webDir ("PIM_Activations_new_{0}.csv" -f $stamp)
-  $newRows | Select-Object Timestamp,MemberUPN,Member,Role,Justification,Activity,Result,ResultReason |
-    Export-Csv -NoTypeInformation -Path $newCsv
-  Write-Host "✅ CSV (new rows): $newCsv"
-} else {
+Write-Host ("🧮 Existing: {0}, New this run: {1}, Total now: {2}" -f $existingCount, $newCount, $totalCount)
+if ($newCount -eq 0) {
   Write-Host "✅ No new rows to export this run."
+} else {
+  Write-Host ("✅ Added {0} new row{1}." -f $newCount, $(if($newCount -eq 1) {''} else {'s'}))
 }
 
-# Persist: JSON store (atomic)
-$jsonAll = $merged | ConvertTo-Json -Depth 6
-$tmpJson = "$storeJson.tmp"
-Set-Content -Path $tmpJson -Value $jsonAll -Encoding utf8
-Move-Item -Path $tmpJson -Destination $storeJson -Force
-Write-Host "✅ Store updated: $storeJson"
+$merged | ConvertTo-Json -Depth 6 | Out-File -FilePath $storePath -Encoding utf8
+Write-Host "✅ Store updated: $storePath"
 
-# Persist: offline JS bundle for the webpage (atomic)
-$jsBody  = "window.PIM_ACTIVATIONS = " + $jsonAll + ";"
-$tmpJs   = "$storeJs.tmp"
-Set-Content -Path $tmpJs -Value $jsBody -Encoding utf8
-Move-Item -Path $tmpJs -Destination $storeJs -Force
-Write-Host "✅ Web data updated: $storeJs"
+@("window.PIM_ACTIVATIONS = ", ($merged | ConvertTo-Json -Depth 6)) -join "" | Out-File -FilePath $jsPath -Encoding utf8
+Write-Host "✅ Web data updated: $jsPath"
 
+if ($DebugTickets -and $script:_ticketProbes -and $script:_ticketProbes.Count -gt 0) {
+  $probePath = Join-Path $OutputPath "ticket_probes.json"
+  $script:_ticketProbes | ConvertTo-Json -Depth 6 | Out-File -FilePath $probePath -Encoding utf8
+  Write-Host "🔎 Ticket diagnostics written to $probePath"
+}
