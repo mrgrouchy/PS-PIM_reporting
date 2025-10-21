@@ -30,6 +30,9 @@
   .footer{color:var(--muted);font-size:12px;margin:6px 0 6px;text-align:center}
   .copyright{color:var(--muted);font-size:12px;text-align:right;margin-top:8px}
 
+  /* links */
+  a.upn-link{color:#0ea5e9;text-decoration:underline;cursor:pointer}
+
   /* User Role Summary */
   .summary-title{font-weight:600;margin:0 0 8px 0}
   .summary-row{
@@ -46,7 +49,7 @@
   .elig-title{margin:10px 0 6px 0; font-weight:600}
   .elig-list{display:grid; gap:6px}
   .elig-item{
-    display:grid; grid-template-columns: 1fr auto auto; /* role info | type badge | last activated */
+    display:grid; grid-template-columns: 1fr auto auto; /* info | badge | last activated */
     gap:6px; align-items:center;
     padding:6px 8px; border-radius:10px; background:#fff; border:1px solid var(--border);
   }
@@ -99,8 +102,8 @@
 
     <!-- Eligible roles -->
     <div class="elig-wrap">
-      <div class="elig-title">Eligible roles</div>
-      <div class="elig-dim" style="margin-bottom:6px">
+      <div class="elig-title" id="eligTitle">Eligible roles</div>
+      <div class="elig-dim" id="eligHint" style="margin-bottom:6px">
         Last activated = most recent completed PIM activation. ✖ = never activated.
         Standing access shows as <strong style="color:#991b1b">Perm active</strong>.
       </div>
@@ -145,9 +148,12 @@
   const tbody = el('tbody');
   const trendCanvas = el('trend');
 
+  const userSummaryCard = el('userSummaryCard');
   const userSummaryBody = el('userSummaryBody');
   const userSummaryNote = el('userSummaryNote');
 
+  const eligTitle = el('eligTitle');
+  const eligHint = el('eligHint');
   const eligibleRolesBody = el('eligibleRolesBody');
   const eligibleRolesNote = el('eligibleRolesNote');
 
@@ -172,6 +178,22 @@
     }));
   }
 
+  // ensure an option exists in a select
+  function ensureOption(sel, val){
+    const opts = Array.from(sel.options).map(o=>o.value);
+    if (val && !opts.includes(val)){
+      const opt = document.createElement('option');
+      opt.value = opt.textContent = val;
+      sel.appendChild(opt);
+    }
+  }
+
+  function findDisplayName(upn){
+    upn = (upn||'').toLowerCase();
+    const r = rows.find(x => (x.MemberUPN||'').toLowerCase() === upn);
+    return r ? (r.Member || '') : '';
+  }
+
   function renderTable(data){
     tbody.innerHTML = '';
     if (!data.length){
@@ -185,9 +207,11 @@
       const tr = document.createElement('tr');
       const ts = r.Timestamp ? new Date(r.Timestamp) : null;
       const tsText = ts && !isNaN(ts) ? ts.toLocaleString() : '';
+      const upn = r.MemberUPN || '';
+      const upnHtml = upn ? `<a href="#" class="upn-link" data-upn="${escapeHtml(upn)}">${escapeHtml(upn)}</a>` : '';
       tr.innerHTML = `
         <td>${escapeHtml(tsText)}</td>
-        <td>${escapeHtml(r.MemberUPN||'')}</td>
+        <td>${upnHtml}</td>
         <td>${escapeHtml(r.Member||'')}</td>
         <td>${escapeHtml(r.Role||'')}</td>
         <td>${escapeHtml(r.Justification||'')}</td>
@@ -199,6 +223,19 @@
     }
     tbody.appendChild(frag);
   }
+
+  // click on MemberUPN -> set user filter + scroll to summary
+  tbody.addEventListener('click', (e)=>{
+    const a = e.target.closest('.upn-link');
+    if (!a) return;
+    e.preventDefault();
+    const upn = a.dataset.upn || '';
+    if (!upn) return;
+    ensureOption(user, upn);
+    user.value = upn;
+    applyFilters();
+    userSummaryCard.scrollIntoView({behavior:'smooth', block:'start'});
+  });
 
   // === Roles & Users facet builders (union of activations + report) ===
   function getAllRoles(){
@@ -294,11 +331,6 @@
     return latest;
   }
 
-  // Has this user ever completed an activation for roleName?
-  function hasActivated(upn, roleName){
-    return getActivationCount(upn, roleName) > 0;
-  }
-
   function renderUserSummary(){
     userSummaryBody.innerHTML = '';
     userSummaryNote.textContent = '';
@@ -341,7 +373,7 @@
           .map(r => r.Principal).filter(Boolean)
       )).sort();
 
-      const neverActivated = eligUsers.filter(u => !hasActivated(u, roleSel));
+      const neverActivated = eligUsers.filter(u => getActivationCount(u, roleSel) === 0);
 
       if (eligUsers.length === 0){
         userSummaryNote.textContent = `No eligible users found for role "${roleSel}".`;
@@ -367,11 +399,7 @@
     userSummaryNote.textContent = 'Select a user to see their completed activations, or pick a role to see eligible users who have never activated it.';
   }
 
-  // ---- Eligible roles list (Perm active detection + no X for perm) ----
-
-  // Treat assignment as permanent/standing if:
-  // - AssignmentType includes "permanent"/"perm"/"standing", OR
-  // - AssignmentStartDate or AssignmentEndDate equals "Permanent"
+  // ---- Eligible roles list (Dual-mode: by user OR by role) ----
   function isStandingAccess(row){
     const t = (row.AssignmentType || '').toLowerCase();
     if (t.includes('permanent') || t.includes('perm') || t.includes('standing')) return true;
@@ -395,70 +423,138 @@
     eligibleRolesBody.innerHTML = '';
     eligibleRolesNote.textContent = '';
 
-    const upn = user.value;
-    if (!upn){
-      eligibleRolesNote.textContent = 'Select a user to see their eligible/standing roles.';
-      return;
-    }
-
+    const upnSel = user.value;
+    const roleSel = role.value;
     const report = Array.isArray(window.PIM_REPORT) ? window.PIM_REPORT : null;
+
     if (!report){
       eligibleRolesNote.textContent = 'Administrators report not loaded. Ensure AdministratorsReport-PIM.data.js is present.';
       return;
     }
 
-    const mine = report.filter(r => (r.Principal || '').toLowerCase() === upn.toLowerCase());
+    // MODE A: User selected -> show that user's roles (existing behavior)
+    if (upnSel){
+      eligTitle.textContent = 'Eligible roles';
+      eligHint.style.display = '';
+      const mine = report.filter(r => (r.Principal || '').toLowerCase() === upnSel.toLowerCase());
+      const eligibleOrStanding = mine.filter(r => (r.AssignmentType||'').toLowerCase().includes('eligible') || isStandingAccess(r));
 
-    // include eligible OR standing (permanent) rows
-    const eligibleOrStanding = mine.filter(r => {
-      const s = (r.AssignmentType || '').toLowerCase();
-      return s.includes('eligible') || isStandingAccess(r);
-    });
+      if (eligibleOrStanding.length === 0){
+        eligibleRolesNote.textContent = 'No eligible or standing access roles for this user.';
+        return;
+      }
 
-    if (eligibleOrStanding.length === 0){
-      eligibleRolesNote.textContent = 'No eligible or standing access roles for this user.';
+      eligibleOrStanding.sort((a,b)=>{
+        const rank = r => isStandingAccess(r) ? 0 :
+          ((r.AssignmentType||'').toLowerCase().includes('eligible') && (r.AssignmentType||'').toLowerCase().includes('active')) ? 1 : 2;
+        const ra = rank(a), rb = rank(b);
+        if (ra !== rb) return ra - rb;
+        return (a.AssignedRole||'').localeCompare(b.AssignedRole||'');
+      });
+
+      for (const r of eligibleOrStanding){
+        const roleName = r.AssignedRole || '(Unknown)';
+        const scope = r.AssignedRoleScope || '/';
+        const { label: typeLabel, cls: badgeCls } = deriveTypeBadge(r);
+
+        let lastHtml;
+        if (isStandingAccess(r)) {
+          lastHtml = `<div class="elig-last" title="Standing access (permanent)">—</div>`;
+        } else {
+          const last = getLastActivationDate(upnSel, roleName);
+          lastHtml = last
+            ? `<div class="elig-last" title="${last.toISOString()}">${last.toLocaleDateString()}</div>`
+            : `<div class="elig-last"><span class="x-badge" title="Never activated">✖</span></div>`;
+        }
+
+        const div = document.createElement('div');
+        div.className = 'elig-item';
+        div.innerHTML = `
+          <div>
+            <div>${escapeHtml(roleName)} <span class="pim-badge" title="PIM RBAC role">PIM</span></div>
+            <div class="elig-dim">Scope: ${escapeHtml(scope)}</div>
+          </div>
+          <div><span class="${badgeCls}">${escapeHtml(typeLabel)}</span></div>
+          ${lastHtml}
+        `;
+        eligibleRolesBody.appendChild(div);
+      }
+      eligibleRolesNote.textContent = `${eligibleOrStanding.length} role${eligibleOrStanding.length>1?'s':''} found for ${upnSel}.`;
       return;
     }
 
-    // order: standing first, then active-eligible, then eligible, then alpha
-    eligibleOrStanding.sort((a,b)=>{
-      const rank = r => isStandingAccess(r) ? 0 :
-        ((r.AssignmentType||'').toLowerCase().includes('eligible') && (r.AssignmentType||'').toLowerCase().includes('active')) ? 1 : 2;
-      const ra = rank(a), rb = rank(b);
-      if (ra !== rb) return ra - rb;
-      return (a.AssignedRole||'').localeCompare(b.AssignedRole||'');
-    });
+    // MODE B: Role selected (no user) -> show all principals with that role (Eligible, Eligible Active, Perm active)
+    if (roleSel){
+      eligTitle.textContent = `Principals for role: ${roleSel}`;
+      eligHint.style.display = '';
+      const rowsForRole = report.filter(r => (r.AssignedRole || '') === roleSel);
+      const eligibleOrStanding = rowsForRole.filter(r => (r.AssignmentType||'').toLowerCase().includes('eligible') || isStandingAccess(r));
 
-    for (const r of eligibleOrStanding){
-      const roleName = r.AssignedRole || '(Unknown)';
-      const scope = r.AssignedRoleScope || '/';
-      const { label: typeLabel, cls: badgeCls } = deriveTypeBadge(r);
-
-      // If permanent, do not show ✖; show an em dash
-      let lastHtml;
-      if (isStandingAccess(r)) {
-        lastHtml = `<div class="elig-last" title="Standing access (permanent)">—</div>`;
-      } else {
-        const last = getLastActivationDate(upn, roleName);
-        lastHtml = last
-          ? `<div class="elig-last" title="${last.toISOString()}">${last.toLocaleDateString()}</div>`
-          : `<div class="elig-last"><span class="x-badge" title="Never activated">✖</span></div>`;
+      if (eligibleOrStanding.length === 0){
+        eligibleRolesNote.textContent = `No eligible or standing access principals for "${roleSel}".`;
+        return;
       }
 
-      const div = document.createElement('div');
-      div.className = 'elig-item';
-      div.innerHTML = `
-        <div>
-          <div>${escapeHtml(roleName)} <span class="pim-badge" title="PIM RBAC role">PIM</span></div>
-          <div class="elig-dim">Scope: ${escapeHtml(scope)}</div>
-        </div>
-        <div><span class="${badgeCls}">${escapeHtml(typeLabel)}</span></div>
-        ${lastHtml}
-      `;
-      eligibleRolesBody.appendChild(div);
+      // Order: standing first, then eligible active, then eligible, then by UPN
+      eligibleOrStanding.sort((a,b)=>{
+        const rank = r => isStandingAccess(r) ? 0 :
+          ((r.AssignmentType||'').toLowerCase().includes('eligible') && (r.AssignmentType||'').toLowerCase().includes('active')) ? 1 : 2;
+        const ra = rank(a), rb = rank(b);
+        if (ra !== rb) return ra - rb;
+        return (a.Principal||'').localeCompare(b.Principal||'');
+      });
+
+      for (const r of eligibleOrStanding){
+        const upn = r.Principal || '';
+        const name = findDisplayName(upn);
+        const scope = r.AssignedRoleScope || '/';
+        const { label: typeLabel, cls: badgeCls } = deriveTypeBadge(r);
+
+        // last-activation logic for this principal & this role
+        let lastHtml;
+        if (isStandingAccess(r)) {
+          lastHtml = `<div class="elig-last" title="Standing access (permanent)">—</div>`;
+        } else {
+          const last = getLastActivationDate(upn, roleSel);
+          lastHtml = last
+            ? `<div class="elig-last" title="${last.toISOString()}">${last.toLocaleDateString()}</div>`
+            : `<div class="elig-last"><span class="x-badge" title="Never activated">✖</span></div>`;
+        }
+
+        const div = document.createElement('div');
+        div.className = 'elig-item';
+        div.innerHTML = `
+          <div>
+            <div><a href="#" class="upn-link" data-upn="${escapeHtml(upn)}">${escapeHtml(upn)}</a>${name ? ` &nbsp;<span class="elig-dim">(${escapeHtml(name)})</span>`:''} <span class="pim-badge" title="PIM RBAC role">PIM</span></div>
+            <div class="elig-dim">Scope: ${escapeHtml(scope)}</div>
+          </div>
+          <div><span class="${badgeCls}">${escapeHtml(typeLabel)}</span></div>
+          ${lastHtml}
+        `;
+        eligibleRolesBody.appendChild(div);
+      }
+      eligibleRolesNote.textContent = `${eligibleOrStanding.length} principal${eligibleOrStanding.length>1?'s':''} found for "${roleSel}".`;
+
+      // Make UPNs clickable here too
+      eligibleRolesBody.addEventListener('click', (e)=>{
+        const a = e.target.closest('.upn-link');
+        if (!a) return;
+        e.preventDefault();
+        const upn = a.dataset.upn || '';
+        if (!upn) return;
+        ensureOption(user, upn);
+        user.value = upn;
+        applyFilters();
+        userSummaryCard.scrollIntoView({behavior:'smooth', block:'start'});
+      }, { once: true });
+
+      return;
     }
 
-    eligibleRolesNote.textContent = `${eligibleOrStanding.length} role${eligibleOrStanding.length>1?'s':''} found for ${upn}.`;
+    // No user and no role selected
+    eligTitle.textContent = 'Eligible roles';
+    eligHint.style.display = '';
+    eligibleRolesNote.textContent = 'Select a user or a role to see details here.';
   }
   // ---------------------------------------------------------------
 
@@ -497,7 +593,6 @@
       const scope = r.AssignedRoleScope || '';
       const displayType = deriveTypeBadge(r).label;
 
-      // For permanent rows, we export LastActivated empty and NeverActivated = "—" (not applicable)
       const isPerm = isStandingAccess(r);
       const last = isPerm ? null : getLastActivationDate(upn, roleName);
       const lastStr = last ? last.toISOString().slice(0,10) : "";
