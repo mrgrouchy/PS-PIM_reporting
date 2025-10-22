@@ -3,7 +3,7 @@ param(
   [int]$Days = 30,
   [datetime]$StartDate = (Get-Date).AddDays(-$Days),
   [datetime]$EndDate   = (Get-Date),
-  [switch]$CompletedOnly,
+  [switch]$CompletedOnly = $true,
   [string]$OutputPath = (Get-Location),
   [switch]$DebugTickets
 )
