@@ -512,8 +512,8 @@
         total++;
         const roleName = p.AssignedRole || '(Unknown)';
         const scope = p.PrincipalDisplayName || 'PAG Group';
-        const typeLabel = isAct ? 'Eligible (Active)' : 'Eligible';
-        const badgeCls = 'elig-badge';
+        const typeLabel = (isAct && !isElig) ? 'Perm active' : (isAct ? 'Eligible (Active)' : 'Eligible');
+        const badgeCls = (isAct && !isElig) ? 'perm-badge' : 'elig-badge';
 
         const div = document.createElement('div');
         div.className = 'elig-item';
@@ -625,12 +625,12 @@
       const isAct  = active.has((upn||'').toLowerCase());
       if (!isElig && !isAct) continue;
       arr.push({
-        Principal: upn,
-        AssignedRole: p.AssignedRole,
-        AssignedRoleScope: p.PrincipalDisplayName || 'PAG Group',
-        AssignmentType: isAct ? 'Eligible (Active)' : 'Eligible',
-        _isPag: true
-      });
+      Principal: upn,
+      AssignedRole: p.AssignedRole,
+      AssignedRoleScope: p.PrincipalDisplayName || 'PAG Group',
+      AssignmentType: (isAct && !isElig) ? 'Perm active' : (isAct ? 'Eligible (Active)' : 'Eligible'),
+      _isPag: true
+    });
     }
 
     return arr;
